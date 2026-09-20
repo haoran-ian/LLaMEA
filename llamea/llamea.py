@@ -79,6 +79,7 @@ class LLaMEA:
         operators=[],
         operator_weight_updater=None,
         adaptive_mutation=False,
+        adaptive_mutation_prompt=None,
         adaptive_prompt=False,
         feature_guided_mutation: bool = False,
         budget=100,
@@ -99,6 +100,7 @@ class LLaMEA:
         novelty_archive_size: Optional[int] = 100,
         evaluate_population=False,
         diff_mode: bool = False,
+        prompt_engineering_mode: bool = False,
         parent_selection: str = "random",
         tournament_size: int = 3,
     ):
@@ -184,6 +186,7 @@ class LLaMEA:
         self.llm: LLM = llm
         self.model = llm.model
         self.diff_mode = diff_mode
+        self.prompt_engineering_mode = prompt_engineering_mode
 
         self.eval_timeout = eval_timeout
         self.f = f  # evaluation function, provides an individual as output.
@@ -310,6 +313,7 @@ class LLaMEA:
         )
 
         self.adaptive_mutation = adaptive_mutation
+        self.adaptive_mutation_prompt = adaptive_mutation_prompt
 
         self.budget = budget
         self.n_parents = n_parents
@@ -522,7 +526,10 @@ class LLaMEA:
             },
         ]
         try:
-            new_individual = self.llm.sample_solution(session_messages, HPO=self.HPO)
+            new_individual = self.llm.sample_solution(
+                session_messages, HPO=self.HPO,
+                prompt_engineering_mode=self.prompt_engineering_mode,
+            )
             new_individual.generation = self.generation
             new_individual.task_prompt = self.task_prompt
             if not self.evaluate_population:
@@ -686,12 +693,15 @@ Provide an improved / rephrased / augmented task prompt only. The intent of the 
 
         if self.adaptive_mutation == True:
             num_lines = len(individuals[0].code.split("\n"))
-            prob = discrete_power_law_distribution(num_lines, 1.5)
-            new_mutation_prompt = f"""Refine the strategy of the selected solution to improve it.
+            if self.adaptive_mutation_prompt == None:
+                prob = discrete_power_law_distribution(num_lines, 1.5)
+                new_mutation_prompt = f"""Refine the strategy of the selected solution to improve it.
 Make sure you only change {(prob*100):.1f}% of the code, which means if the code has 100 lines, you can only change {prob*100} lines, and the rest of the lines should remain unchanged.
 This input code has {num_lines} lines, so you can only change {max(1, int(prob*num_lines))} lines, the rest {num_lines-max(1, int(prob*num_lines))} lines should remain unchanged.
 This changing rate {(prob*100):.1f}% is a mandatory requirement, you cannot change more or less than this rate.
 """
+            else:
+                new_mutation_prompt = self.adaptive_mutation_prompt
             self.mutation_prompts = [new_mutation_prompt]
 
         guidance_message = self.feature_guidance_message.strip()
@@ -703,6 +713,12 @@ This changing rate {(prob*100):.1f}% is a mandatory requirement, you cannot chan
         mutation_operator = f"{operator.__repr__()}"
         if guidance_message:
             mutation_operator = f"{operator}\n\n{guidance_message}"
+        if self.adaptive_mutation:
+            mutation_operator = self.mutation_prompts[0]
+        else:
+            mutation_operator = "Refine the strategy of the selected solution to improve it."
+        print(mutation_operator)
+
 
         individual = random.choice(individuals)
         task_prompt = (
@@ -1163,6 +1179,7 @@ The selected solutions to update are:\n\n"""
                 HPO=self.HPO,
                 base_code=individual.code,
                 diff_mode=self.diff_mode,
+                prompt_engineering_mode=self.prompt_engineering_mode,
             )
             evolved_individual.generation = self.generation
             evolved_individual.task_prompt = individual_copy.task_prompt

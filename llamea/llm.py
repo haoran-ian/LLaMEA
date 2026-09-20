@@ -125,6 +125,7 @@ class LLM(ABC):
         HPO: bool = False,
         base_code: str | None = None,
         diff_mode: bool = False,
+        prompt_engineering_mode: bool = False,
     ):
         """Generate or mutate a solution using the language model.
 
@@ -157,28 +158,35 @@ class LLM(ABC):
         if self.log:
             self.logger.log_conversation(self.model, message)
 
-        code = self.extract_algorithm_code(message)
+        if not prompt_engineering_mode:
+            code = self.extract_algorithm_code(message)
 
-        if diff_mode and isinstance(base_code, str):
-            dfm = DiffModeManager(base_code, code)
-            code = dfm()
+            if diff_mode and isinstance(base_code, str):
+                dfm = DiffModeManager(base_code, code)
+                code = dfm()
 
-        name = re.findall(
-            r"(?:def|class)\s*(\w*).*\:",
-            code,
-            re.IGNORECASE,
-        )[0]
-        desc = self.extract_algorithm_description(message)
-        cs = None
-        if HPO and ConfigurationSpace is not None:
-            cs = self.extract_configspace(message)
-        new_individual = Solution(
-            name=name,
-            description=desc,
-            configspace=cs,
-            code=code,
-            parent_ids=parent_ids,
-        )
+            name = re.findall(
+                r"(?:def|class)\s*(\w*).*\:",
+                code,
+                re.IGNORECASE,
+            )[0]
+            desc = self.extract_algorithm_description(message)
+            cs = None
+            if HPO and ConfigurationSpace is not None:
+                cs = self.extract_configspace(message)
+            new_individual = Solution(
+                name=name,
+                description=desc,
+                configspace=cs,
+                code=code,
+                parent_ids=parent_ids,
+            )
+        else:
+            code = self.extract_expected_text(message)
+            new_individual = Solution(
+                code=code,
+                parent_ids=parent_ids,
+            )
 
         return new_individual
 
@@ -217,7 +225,8 @@ class LLM(ABC):
         Raises:
             NoCodeException: If no code block is found within the message.
         """
-        match = re.search(self.code_pattern, message, re.DOTALL | re.IGNORECASE)
+        match = re.search(self.code_pattern, message,
+                          re.DOTALL | re.IGNORECASE)
         if match:
             code = match.group(1)
             main_guard_pattern = re.compile(
@@ -243,6 +252,14 @@ class LLM(ABC):
         """
         pattern = r"#\s*Description\s*:\s*(.*)"
         match = re.search(pattern, message, re.IGNORECASE)
+        if match:
+            return match.group(1)
+        else:
+            return ""
+
+    def extract_expected_text(self, message):
+        pattern = r'```prompt\s*(.*?)\s*```'
+        match = re.search(pattern, message, re.DOTALL)
         if match:
             return match.group(1)
         else:
@@ -305,7 +322,8 @@ class OpenAI_LLM(LLM):
                 if getattr(err, "response", None) is not None:
                     retry_after = err.response.headers.get("Retry-After")
 
-                wait = int(retry_after) if retry_after else default_delay * attempt
+                wait = int(
+                    retry_after) if retry_after else default_delay * attempt
                 time.sleep(wait)
 
             except (
@@ -391,7 +409,8 @@ class Gemini_LLM(LLM):
 
         self.client = genai.Client(
             api_key=self.api_key
-        )  # expecting implicit pull for env var GOOGLE_API_KEY, too risky to pickle.
+            # expecting implicit pull for env var GOOGLE_API_KEY, too risky to pickle.
+        )
 
     def __deepcopy__(self, memo):
         cls = self.__class__
@@ -449,10 +468,117 @@ class Gemini_LLM(LLM):
                     wait = delay.seconds + 1  # add 1 second to avoid immediate retry
                 else:
                     # Sometimes retry_delay only appears in the string—grab it
-                    m = re.search(r"retry_delay\s*{\s*seconds:\s*(\d+)", str(err))
+                    m = re.search(
+                        r"retry_delay\s*{\s*seconds:\s*(\d+)", str(err))
                     wait = int(m.group(1)) if m else default_delay * attempt
 
                 time.sleep(wait)
+
+
+class HF_LLM(LLM):
+    """
+    A manager class for handling requests to HuggingFace's models.
+    """
+
+    def __init__(self, api_key, model="Qwen/Qwen3.8-27B:novita", temperature=0.8, **kwargs):
+        """
+        Initializes the LLM manager with an API key and model name.
+
+        Args:
+            api_key (str): api key for authentication.
+            model (str, optional): model abbreviation. Defaults to "gpt-4-turbo".
+                Options are: gpt-3.5-turbo, gpt-4-turbo, gpt-4o, and others from OpeNAI models library.
+        """
+        if openai is None:  # pragma: no cover - optional dependency
+            raise ImportError(
+                "openai is required to use HF_LLM. Install the 'openai' package."
+            )
+        super().__init__(api_key, model, None, **kwargs)
+        self._client_kwargs = dict(
+            base_url="https://router.huggingface.co/v1", api_key=api_key)
+        self.client = openai.OpenAI(**self._client_kwargs)
+        logging.getLogger("openai").setLevel(logging.ERROR)
+        logging.getLogger("httpx").setLevel(logging.ERROR)
+        self.temperature = temperature
+
+    def query(self, session_messages, max_retries: int = 5, default_delay: int = 10):
+        """
+        Sends a conversation history to the configured model and returns the response text.
+
+        Args:
+            session_messages (list of dict): A list of message dictionaries with keys
+                "role" (e.g. "user", "assistant") and "content" (the message text).
+
+        Returns:
+            str: The text content of the LLM's response.
+        """
+
+        attempt = 0
+        while True:
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=session_messages,
+                    extra_body={
+                        "chat_template_kwargs": {
+                            "enable_thinking": False,
+                            "preserve_thinking": False,
+                        }
+                    },
+                    # reasoning_effort="minimal",
+                    temperature=self.temperature,
+                )
+                return response.choices[0].message.content
+
+            except openai.RateLimitError as err:
+                attempt += 1
+                if attempt > max_retries:
+                    raise
+
+                retry_after = None
+                if getattr(err, "response", None) is not None:
+                    retry_after = err.response.headers.get("Retry-After")
+
+                wait = int(
+                    retry_after) if retry_after else default_delay * attempt
+                time.sleep(wait)
+
+            except (
+                openai.APITimeoutError,
+                openai.APIConnectionError,
+                openai.APIError,
+            ) as err:
+                attempt += 1
+                if attempt > max_retries:
+                    raise
+                time.sleep(default_delay * attempt)
+
+    # ---------- pickling / deepcopy helpers ----------
+    def __getstate__(self):
+        """Return the picklable part of the instance."""
+        state = self.__dict__.copy()
+        state.pop("client", None)  # the client itself is NOT picklable
+        return state  # everything else is fine
+
+    def __setstate__(self, state):
+        """Restore from a pickled state."""
+        self.__dict__.update(state)  # put back the simple stuff
+        self.client = openai.OpenAI(
+            **self._client_kwargs
+        )  # rebuild non-picklable handle
+
+    def __deepcopy__(self, memo):
+        """Explicit deepcopy that skips the client and recreates it."""
+        cls = self.__class__
+        new = cls.__new__(cls)
+        memo[id(self)] = new
+        for k, v in self.__dict__.items():
+            if k == "client":
+                continue
+            setattr(new, k, copy.deepcopy(v, memo))
+        # finally restore client
+        new.client = openai.OpenAI(**new._client_kwargs)
+        return new
 
 
 class Ollama_LLM(LLM):
@@ -674,7 +800,8 @@ class MLX_LM_LLM(LLM):
             if k in ["llm", "tokenizer"]:
                 continue
             setattr(new, k, copy.deepcopy(v, memo))
-        new.llm = self.llm  # <- reference symantics copy for massive object `llm`.
+        # <- reference symantics copy for massive object `llm`.
+        new.llm = self.llm
         new.tokenizer = self.tokenizer
         return new
 
@@ -710,7 +837,8 @@ class MLX_LM_LLM(LLM):
                     self.llm,
                     self.tokenizer,
                     prompt,
-                    max_tokens=self.max_tokens,  # Disable limit on token count.
+                    # Disable limit on token count.
+                    max_tokens=self.max_tokens,
                 )
                 response = re.sub(  # Remove thinking section, if avaiable.
                     r"<think>.*?</think>", "", str(response), flags=re.DOTALL

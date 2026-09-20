@@ -3,6 +3,7 @@ from .llm import (
     LLM,
     Dummy_LLM,
     Gemini_LLM,
+    HF_LLM,
     Multi_LLM,
     Ollama_LLM,
     OpenAI_LLM,

@@ -281,7 +281,13 @@ class OpenAI_LLM(LLM):
         logging.getLogger("httpx").setLevel(logging.ERROR)
         self.temperature = temperature
 
-    def query(self, session_messages, max_retries: int = 5, default_delay: int = 10):
+    def query(
+        self,
+        session_messages,
+        max_retries: int = 5,
+        default_delay: int = 10,
+        extra_body=None,
+    ):
         """
         Sends a conversation history to the configured model and returns the response text.
 
@@ -293,6 +299,10 @@ class OpenAI_LLM(LLM):
             str: The text content of the LLM's response.
         """
 
+        request_kwargs = {}
+        if extra_body is not None:
+            request_kwargs["extra_body"] = extra_body
+
         attempt = 0
         while True:
             try:
@@ -300,6 +310,7 @@ class OpenAI_LLM(LLM):
                     model=self.model,
                     messages=session_messages,
                     temperature=self.temperature,
+                    **request_kwargs,
                 )
                 return response.choices[0].message.content
 
@@ -560,6 +571,46 @@ class DeepSeek_LLM(OpenAI_LLM):
         self.base_url = "https://api.deepseek.com"
         self._client_kwargs["base_url"] = self.base_url
         self.client = openai.OpenAI(**self._client_kwargs)
+
+
+class Cerebellum_LLM(OpenAI_LLM):
+    """A manager class for the model (qwen3.8-27b) running on cerebellum server."""
+
+    def __init__(
+        self,
+        api_key,
+        model="qwen3.8-27b",
+        temperature=0.8,
+        enable_thinking=False,
+        **kwargs,
+    ):
+        """Initialize Cerebellum with an optional thinking mode override.
+
+        Thinking is disabled by default. Set enable_thinking=True to enable
+        it, or None to use the server's default.
+        """
+        super().__init__(api_key, model=model, temperature=temperature, **kwargs)
+        self.enable_thinking = enable_thinking
+        self.base_url = "http://127.0.0.1:18000/v1"
+        self._client_kwargs["base_url"] = self.base_url
+        self.client = openai.OpenAI(**self._client_kwargs)
+
+    def query(
+        self, session_messages, max_retries: int = 5, default_delay: int = 10
+    ):
+        extra_body = None
+        if self.enable_thinking is not None:
+            extra_body = {
+                "chat_template_kwargs": {
+                    "enable_thinking": self.enable_thinking,
+                }
+            }
+        return super().query(
+            session_messages,
+            max_retries=max_retries,
+            default_delay=default_delay,
+            extra_body=extra_body,
+        )
 
 
 class Anthropic_LLM(LLM):

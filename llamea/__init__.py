@@ -9,6 +9,7 @@ from .llm import (
     OpenAI_LLM,
     LMStudio_LLM,
     MLX_LM_LLM,
+    Cerebellum_LLM,
 )
 from .loggers import ExperimentLogger
 from .solution import Solution

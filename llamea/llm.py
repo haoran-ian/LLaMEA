@@ -2,6 +2,8 @@
 LLM modules to connect to different LLM providers. Also extracts code, name and description.
 """
 
+import os
+import ast
 import copy
 import logging
 import pickle
@@ -48,8 +50,42 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
     ConfigurationSpace = None
 
 from .diffmodemanager import DiffModeManager
+from .mutation_control import measure_changes
 from .solution import Solution
 from .utils import NoCodeException, apply_code_delta
+
+
+def canonicalize_blank_lines(code):
+    """Normalize blank-line spaces, retaining every row and Python AST.
+
+    Multiline string contents are protected. This is independent of the
+    requested rate, edit plan, and parent; executable edits are untouched.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code
+    protected = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.JoinedStr) or
+                isinstance(node, ast.Constant) and
+                isinstance(node.value, (str, bytes))):
+            protected.update(range(node.lineno, node.end_lineno + 1))
+    result = []
+    for number, line in enumerate(code.splitlines(keepends=True), 1):
+        if number not in protected and not line.strip():
+            # Keep a final whitespace-only physical row even without LF.
+            line = "\r\n" if line.endswith("\r\n") else "\n"
+        result.append(line)
+    candidate = "".join(result)
+    if len(candidate.splitlines()) != len(code.splitlines()):
+        return code
+    try:
+        if ast.dump(ast.parse(candidate)) != ast.dump(tree):
+            return code
+    except SyntaxError:
+        return code
+    return candidate
 
 
 class LLM(ABC):
@@ -132,6 +168,8 @@ class LLM(ABC):
         HPO: bool = False,
         base_code: str | None = None,
         diff_mode: bool = False,
+        mutation_edit_protocol: bool = False,
+        normalize_blank_lines: bool = False,
     ):
         """Generate or mutate a solution using the language model.
 
@@ -143,6 +181,10 @@ class LLM(ABC):
             diff_mode: When ``True``, interpret the LLM response as a unified
                 diff patch to apply to ``base_code`` rather than full source
                 code.
+            mutation_edit_protocol: Record raw and executed mutation metrics
+                relative to base_code; does not change naming or extraction.
+            normalize_blank_lines: Normalize spaces on blank lines outside
+                strings, preserving the physical line count and Python AST.
 
         Returns:
             tuple: A tuple containing the new algorithm code, its class name, its full descriptive name and an optional configuration space object.
@@ -165,10 +207,14 @@ class LLM(ABC):
             self.logger.log_conversation(self.model, message)
 
         code = self.extract_algorithm_code(message)
+        raw_code = code
 
         if diff_mode and isinstance(base_code, str):
             dfm = DiffModeManager(base_code, code)
             code = dfm()
+
+        if normalize_blank_lines:
+            code = canonicalize_blank_lines(code)
 
         name = re.findall(
             r"(?:def|class)\s*(\w*).*\:",
@@ -187,6 +233,11 @@ class LLM(ABC):
             parent_ids=parent_ids,
         )
 
+        if mutation_edit_protocol and isinstance(base_code, str):
+            new_individual.add_metadata("mutation_control", {
+                "raw": measure_changes(base_code, raw_code),
+                "executed": measure_changes(base_code, code),
+            })
         return new_individual
 
     def extract_configspace(self, message):
@@ -213,7 +264,7 @@ class LLM(ABC):
 
     def extract_algorithm_code(self, message):
         """
-        Extracts algorithm code from a given message string using regular expressions.
+        Extract the last complete, explicitly Python-tagged fenced block.
 
         Args:
             message (str): The message string containing the algorithm code.
@@ -222,11 +273,19 @@ class LLM(ABC):
             str: Extracted algorithm code.
 
         Raises:
-            NoCodeException: If no code block is found within the message.
+            NoCodeException: If no complete Python-tagged block is found.
         """
-        match = re.search(self.code_pattern, message, re.DOTALL | re.IGNORECASE)
+        # Match whole blocks, including non-Python blocks, so a plan block's
+        # closing fence cannot be mistaken for a new opening fence.
+        blocks = re.finditer(
+            r"^[ \t]*```([^\r\n`]*)\r?\n(.*?)\r?\n[ \t]*```[ \t]*(?=\r?$)",
+            message, re.MULTILINE | re.DOTALL,
+        )
+        matches = [block for block in blocks
+                   if block.group(1).strip().lower() == "python"]
+        match = matches[-1] if matches else None
         if match:
-            code = match.group(1)
+            code = match.group(2)
             main_guard_pattern = re.compile(
                 r"^\s*if __name__\s*={1,2}\s*['\"]__main__['\"]\s*:\s*$",
                 re.MULTILINE,
@@ -287,6 +346,7 @@ class OpenAI_LLM(LLM):
         max_retries: int = 5,
         default_delay: int = 10,
         extra_body=None,
+        max_tokens=None,
     ):
         """
         Sends a conversation history to the configured model and returns the response text.
@@ -300,6 +360,8 @@ class OpenAI_LLM(LLM):
         """
 
         request_kwargs = {}
+        if max_tokens is not None:
+            request_kwargs["max_tokens"] = max_tokens
         if extra_body is not None:
             request_kwargs["extra_body"] = extra_body
 
@@ -574,14 +636,18 @@ class DeepSeek_LLM(OpenAI_LLM):
 
 
 class Cerebellum_LLM(OpenAI_LLM):
-    """A manager class for the model (qwen3.8-27b) running on cerebellum server."""
+    """OpenAI-compatible client for Cerebellum qwen3.8-27b."""
 
     def __init__(
         self,
         api_key,
         model="qwen3.8-27b",
-        temperature=0.8,
+        temperature=0.7,
         enable_thinking=False,
+        base_url=None,
+        max_tokens=16384,
+        timeout=600,
+        max_retries=3,
         **kwargs,
     ):
         """Initialize Cerebellum with an optional thinking mode override.
@@ -589,10 +655,19 @@ class Cerebellum_LLM(OpenAI_LLM):
         Thinking is disabled by default. Set enable_thinking=True to enable
         it, or None to use the server's default.
         """
-        super().__init__(api_key, model=model, temperature=temperature, **kwargs)
+        super().__init__(
+            api_key, model=model, temperature=temperature, **kwargs
+        )
         self.enable_thinking = enable_thinking
-        self.base_url = "http://127.0.0.1:18000/v1"
-        self._client_kwargs["base_url"] = self.base_url
+        self.max_tokens = max_tokens
+        self.base_url = (
+            base_url
+            or os.getenv("CEREBELLUM_BASE_URL")
+            or "http://127.0.0.1:18000/v1"
+        ).rstrip("/")
+        self._client_kwargs.update(
+            base_url=self.base_url, timeout=timeout, max_retries=max_retries
+        )
         self.client = openai.OpenAI(**self._client_kwargs)
 
     def query(
@@ -610,6 +685,7 @@ class Cerebellum_LLM(OpenAI_LLM):
             max_retries=max_retries,
             default_delay=default_delay,
             extra_body=extra_body,
+            max_tokens=self.max_tokens,
         )
 
 
